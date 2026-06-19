@@ -162,3 +162,48 @@
     - 왜: 리포트는 이제 판단을 *구동*하지 않고 *설명*한다 → "왜 막혔나"를 `reason`+`layer`로 즉시 추적. 죽은 플래그도 정보로만 남김. 파트 4 로깅·파트 5 검증과 연결.
     - 어디서: §2 `GateReport`/`InputFlags`, §8 가드레일 노드, §14 출력부.
     - DoD: 플래그가 차단 분기에 안 쓰이고, 차단 케이스에서 `block/reason/layer/message`가 `GateReport`(및 §14 출력)에서 확인된다.
+
+---
+
+### 🔄 추가사항 (260619 후속): 멀티턴 재예측 over-block 수정 (`T4`)
+
+> 대상 노트북: **`manufacturing_agent_v2.ipynb`** (T1~T3 구현본). §14 실행 시나리오 검증 중 발견된 over-block을 수정한다.
+
+**문제** — §14 턴2 `"토크만 60으로 바꿔서 다시 봐줘."`가 **실제 LLM 2층**에서 `no_control_authority`로 차단됨(`input_gate` → `('input_gate','FAIL')`). 턴2는 *직전 예측의 입력값을 바꿔 재예측*해달라는 본업 요청인데 차단됨.
+
+**원인** — `input_gate`는 **현재 턴 원문만** 본다. 단발 문장 `"토크를 60으로 바꿔"`는 setpoint 변경 **제어 명령**(`"토크 60으로 올려"`, 본 문서 §"명령 vs 자문"의 차단 예시)과 표면형이 같아, 맥락 없이 보면 2층 LLM이 명령으로 오판한다. (= 주의 5⑤ over-block이 실제로 발생한 사례.)
+
+**근거(프로브로 확인)** — `input_gate`는 그래프 첫 노드라 *이번 턴*의 예측은 없지만, **체크포인터(thread_id=session_id)가 직전 턴 state를 복원**해 넘긴다. 깨끗한 세션으로 턴1→턴2를 돌려 턴2의 `input_gate`가 받은 state를 찍은 결과:
+
+| 턴 | has_prediction_result | context_packet.selected_machine_values | intent |
+| --- | --- | --- | --- |
+| 턴1(첫 턴) | false | — | null |
+| 턴2 | **true** | **{torque:50, rotational_speed:1300, tool_wear:210, air_temperature:300, process_temperature:305, type:L}** | **manufacturing** |
+
+→ 직전 입력 `torque=50`이 state에 살아 있으므로, "토크만 60으로 바꿔"가 *그 입력을 바꾸는 재예측*임을 판별할 재료가 `input_gate`에 이미 도착한다. **과거 대화 원문을 끌어올 필요 없음.**
+
+**채택 방식 — 옵션 2 (1층 결정론적 휴리스틱).** 디버깅 용이성·오프라인 재현성을 우선해 1층에서 결정론적으로 거른다.
+
+- **발동 조건(3개 모두 만족 시)**: ① 직전 예측 존재(`state["prediction_result"] is not None`) ② 재분석 동사 패턴(`_REPREDICT_PATTERNS`: `다시\s*(봐|보|…)`, `재\s*(예측|진단|…)`, `바꿔서?.*(봐|…)`) ③ 현재 메시지에 수치 포함(`contains_sensor_values`). → **2층 LLM을 건너뛰고 통과.**
+- **over-pass 경계(반드시 유지)**: 재분석 동사 없는 **순수 제어 명령 `"토크 60으로 올려"`는 휴리스틱에 안 걸려** 2층 LLM/하류 SafetyGate가 처리한다. 즉 *명확한 재예측만* 통과시키고 모호한 건 2층에 맡긴다.
+- **관측**: 결정 결과를 `GateReport.details["repredict_followup"]`(bool)에 기록 — "왜 통과/2층행인지"를 즉시 추적(디버깅 가시성).
+- **⚠️ 향후 디벨롭**: 표현 변형(`"60으로 해서 다시"` 등 패턴 밖)까지 견디려면 **옵션 1(2층 LLM에 직전 입력/예측/intent를 *맥락 라벨*로 주입해 재예측 vs 제어를 LLM이 판별)** 또는 **옵션 3(1층 좁힘 + 2층 라벨 병행, 다층 방어)** 으로 확장한다. 옵션 2는 그 1단계(결정론적 안전망)에 해당한다.
+
+**§N 매핑 추가**
+
+| §(문서 표기) | 노트북 셀 식별자 | 핵심 심볼 | 할 일 |
+| --- | --- | --- | --- |
+| §8 input_gate | `# ---------- gates/input_gate.py ----------` | `input_gate`, `_REPREDICT_PATTERNS`(신설) | 1층 통과분에 재예측 휴리스틱 추가 → 발동 시 2층 skip·통과. `details["repredict_followup"]` 기록 (마커 `T4`) |
+| §14 실행 시나리오 | `# ---------- (실행 셀) ----------` | 끝 assert 테스트 셀 | 아래 14~16 케이스 추가 |
+
+**테스트 케이스 표 추가** (오프라인·결정론적 — 실제 over-block은 실제 LLM에서만 재현되므로 `repredict_followup` 플래그로 휴리스틱 자체를 검증)
+
+| # | 입력 (`user_message`) | 직전 예측 | repredict_followup | block(offline) | 비고 |
+| --- | --- | --- | --- | --- | --- |
+| 14 | `토크만 60으로 바꿔서 다시 봐줘.` | 있음 | **true** | false | 재예측 follow-up 통과 (턴2 over-block 해소) |
+| 15 | `토크 60으로 올려.` | 있음 | **false** | false(offline) | 순수 제어 명령 → 휴리스틱 미발동(over-pass 방지), 실제 LLM 2층이 `no_control_authority` 판정 |
+| 16 | `토크만 60으로 바꿔서 다시 봐줘.` | **없음(첫 턴)** | **false** | false | 직전 예측 없으면 미발동 (첫 턴 안전) |
+
+**마커 규칙(A) 추가**: `<작업번호>`에 `T4`(멀티턴 재예측 over-block 수정) 추가. 예: `# [GUARDRAIL-260619] T4 재예측 follow-up이면 2층 skip하고 통과`.
+
+**DoD**: 턴2형 재예측 입력이 휴리스틱으로 통과(`repredict_followup=true`)하고, 순수 제어 명령은 미발동(`false`)이며, 첫 턴(직전 예측 없음)은 미발동. 기존 13케이스·StubLLM 폴백 회귀 불변.
